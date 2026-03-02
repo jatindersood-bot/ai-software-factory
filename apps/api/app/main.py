@@ -6,6 +6,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from github.GithubException import GithubException
+from sqlalchemy import select
 
 from app.db import get_db, init_db
 from app.models import Project, Run, Artifact, Approval
@@ -19,6 +21,7 @@ from app.schemas import (
     ArtifactResponse,
 )
 from app.agents import AGENT_KEYS
+from app.github_client import ensure_repo, create_branch_from_default, upsert_file, open_pr
 
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "./artifacts")).resolve()
 
@@ -74,6 +77,26 @@ def get_project(project_id: int):
         return ProjectResponse.model_validate(project)
 
 
+@app.post("/projects/{project_id}/github/init", response_model=ProjectResponse)
+def init_project_github(project_id: int):
+    with get_db() as db:
+        project = db.get(Project, project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        repo_name = f"factory-project-{project_id}"
+        repo = ensure_repo(repo_name)
+
+        project.github_owner = repo.owner.login
+        project.github_repo = repo.name
+        project.github_repo_url = repo.html_url
+        project.github_default_branch = repo.default_branch
+
+        db.flush()
+        db.refresh(project)
+        return ProjectResponse.model_validate(project)
+
+
 @app.get("/projects/{project_id}/timeline")
 def get_project_timeline(project_id: int):
     with get_db() as db:
@@ -82,6 +105,63 @@ def get_project_timeline(project_id: int):
             raise HTTPException(status_code=404, detail="Project not found")
         runs = db.query(Run).filter(Run.project_id == project_id).order_by(Run.created_at.desc()).all()
         return [_run_response(r, include_artifacts=False) for r in runs]
+
+
+@app.post("/projects/{project_id}/github/pr/docs")
+def create_docs_pr(project_id: int):
+    with get_db() as db:
+        project = db.get(Project, project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        repo_name = project.github_repo or f"factory-project-{project_id}"
+        repo = ensure_repo(repo_name)
+
+        default_branch = project.github_default_branch or repo.default_branch
+        docs_branch = "docs/init"
+
+        try:
+            create_branch_from_default(repo, default_branch, docs_branch)
+        except GithubException as e:
+            # Ignore error if branch already exists
+            if e.status != 422:
+                raise
+
+        # For each agent key, pick latest artifact by created_at (plain rows to avoid detached instances)
+        agent_keys = ["idea_clarifier", "prd", "architecture"]
+        artifacts_by_agent = {}
+        for agent_key in agent_keys:
+            row = db.execute(
+                select(Artifact.id, Artifact.path)
+                .join(Run, Artifact.run_id == Run.id)
+                .where(Run.project_id == project_id, Run.agent_key == agent_key)
+                .order_by(Artifact.created_at.desc())
+                .limit(1)
+            ).first()
+            if row:
+                artifacts_by_agent[agent_key] = {"id": row.id, "path": row.path}
+
+    # Read artifact files and upsert into docs/*.md
+    agent_to_path = {
+        "idea_clarifier": "docs/idea_clarifier.md",
+        "prd": "docs/prd.md",
+        "architecture": "docs/architecture.md",
+    }
+
+    for agent_key, a in artifacts_by_agent.items():
+        full_path = ARTIFACTS_DIR / a["path"]
+        if not full_path.is_file():
+            continue
+        content = full_path.read_text(encoding="utf-8")
+        target_path = agent_to_path[agent_key]
+        message = f"Update {target_path} from {agent_key} artifact for project {project_id}"
+        upsert_file(repo, docs_branch, target_path, content, message)
+
+    pr_title = f"Add docs for project {project_id}"
+    pr_body = f"Automatically generated documentation for project {project_id}."
+    pr_url = open_pr(repo, pr_title, pr_body, head_branch=docs_branch, base_branch=default_branch)
+
+    return {"pr_url": pr_url}
 
 
 @app.post("/projects/{project_id}/runs", response_model=RunResponse)

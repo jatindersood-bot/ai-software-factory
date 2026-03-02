@@ -3,7 +3,25 @@
 import os
 from pathlib import Path
 
-AGENT_KEYS = ("idea_clarifier", "prd", "architecture")
+AGENT_KEYS = [
+    "idea_clarifier",
+    "prd",
+    "architecture",
+    "ai_development",
+]
+
+AI_DEVELOPMENT_CONFIG = {
+    "summary": "...",
+    "artifacts": [
+        {"path": "IMPLEMENTATION_PLAN.md", "type": "markdown"},
+        {"path": "CODEBASE_TREE.md", "type": "markdown"},
+        {"path": "generated_code/README.md", "type": "text"},
+    ],
+    "proposed_actions": {
+        "write_workspace": True,
+        "open_github_pr": False,
+    },
+}
 
 def _get_artifacts_dir() -> Path:
     # Compute at call-time so dotenv-loaded env vars are respected.
@@ -134,6 +152,25 @@ def architecture(project_title: str, project_idea: str, input_json: dict | None)
 """
 
 
+def ai_development(project_title: str, project_idea: str, input_json: dict):
+    return """
+# Implementation Plan
+
+## Backend
+- Create FastAPI app
+- Create database models
+- Implement endpoints
+
+## Frontend
+- Create dashboard
+- Implement project view
+- Implement run inspector
+
+## Notes
+This is initial scaffolding based on approved architecture.
+"""
+
+
 def run_agent(agent_key: str, project_title: str, project_idea: str, input_json: dict | None) -> str:
     """Dispatch to the correct agent and return markdown."""
     if agent_key == "idea_clarifier":
@@ -142,4 +179,6 @@ def run_agent(agent_key: str, project_title: str, project_idea: str, input_json:
         return prd(project_title, project_idea, input_json)
     if agent_key == "architecture":
         return architecture(project_title, project_idea, input_json)
+    if agent_key == "ai_development":
+        return ai_development(project_title, project_idea, input_json or {})
     raise ValueError(f"Unknown agent_key: {agent_key}")

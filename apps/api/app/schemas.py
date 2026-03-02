@@ -16,6 +16,10 @@ class ProjectResponse(BaseModel):
     id: int
     title: str
     idea: str
+    github_owner: Optional[str] = None
+    github_repo: Optional[str] = None
+    github_repo_url: Optional[str] = None
+    github_default_branch: str = "main"
     created_at: datetime
 
     class Config:

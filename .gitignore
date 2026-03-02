@@ -1,1 +1,22 @@
+# Python
+apps/api/.venv/
+__pycache__/
+*.pyc
+
+# Node
+apps/web/node_modules/
+.next/
+
+# Env files
 .env
+.env.local
+
+# Docker volumes
+pgdata/
+
+# Artifacts + workspace (generated)
+artifacts/
+workspaces/
+
+# OS
+.DS_Store

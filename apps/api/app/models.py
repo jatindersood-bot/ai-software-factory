@@ -19,6 +19,10 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     idea: Mapped[str] = mapped_column(Text, nullable=False)
+    github_owner: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    github_repo: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    github_repo_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    github_default_branch: Mapped[str] = mapped_column(String(64), nullable=False, default="main")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     runs: Mapped[list["Run"]] = relationship("Run", back_populates="project")
