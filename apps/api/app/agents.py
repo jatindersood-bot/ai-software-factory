@@ -1,7 +1,8 @@
-"""Agent implementations. Each returns markdown content."""
+"""Agent implementations. Each returns markdown content or structured output."""
 
 import os
 from pathlib import Path
+from typing import Any, Dict
 
 AGENT_KEYS = [
     "idea_clarifier",
@@ -152,26 +153,56 @@ def architecture(project_title: str, project_idea: str, input_json: dict | None)
 """
 
 
-def ai_development(project_title: str, project_idea: str, input_json: dict):
-    return """
-# Implementation Plan
+def ai_development(project_title: str, project_idea: str, input_json: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    implementation_plan = f"""# Implementation Plan
+
+## Project
+- Title: {project_title}
 
 ## Backend
-- Create FastAPI app
-- Create database models
-- Implement endpoints
+- FastAPI service
+- Postgres models: Project, Run, Artifact, Approval
+- Endpoints for Projects, Runs, Artifacts
 
 ## Frontend
-- Create dashboard
-- Implement project view
-- Implement run inspector
+- Next.js pages: project create, timeline, run inspector, artifacts browser
 
-## Notes
-This is initial scaffolding based on approved architecture.
+## Next steps
+- Add workspace apply
+- Add DIFF generation
+- Add GitHub PR automation
 """
 
+    codebase_tree = """# Codebase Tree (proposed)
 
-def run_agent(agent_key: str, project_title: str, project_idea: str, input_json: dict | None) -> str:
+generated_code/
+  backend/
+    app/
+      main.py
+  frontend/
+    app/
+      page.tsx
+  README.md
+"""
+
+    # Minimal scaffold files (safe starter)
+    files = {
+        "README.md": f"# {project_title}\n\n{project_idea}\n",
+        "backend/app/main.py": "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n",
+        "frontend/app/page.tsx": "export default function Home(){return <main style={{padding:20}}>Hello AI Factory</main>}\n",
+    }
+
+    return {
+        "summary": "Generated implementation plan + proposed scaffold files.",
+        "artifacts": {
+            "IMPLEMENTATION_PLAN.md": implementation_plan,
+            "CODEBASE_TREE.md": codebase_tree,
+        },
+        "generated_files": files,
+    }
+
+
+def run_agent(agent_key: str, project_title: str, project_idea: str, input_json: dict | None) -> str | Dict[str, Any]:
     """Dispatch to the correct agent and return markdown."""
     if agent_key == "idea_clarifier":
         return idea_clarifier(project_title, project_idea, input_json)
@@ -180,5 +211,5 @@ def run_agent(agent_key: str, project_title: str, project_idea: str, input_json:
     if agent_key == "architecture":
         return architecture(project_title, project_idea, input_json)
     if agent_key == "ai_development":
-        return ai_development(project_title, project_idea, input_json or {})
+        return ai_development(project_title, project_idea, input_json)
     raise ValueError(f"Unknown agent_key: {agent_key}")
