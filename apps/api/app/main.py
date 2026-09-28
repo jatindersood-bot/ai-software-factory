@@ -22,6 +22,7 @@ from app.schemas import (
 )
 from app.agents import AGENT_KEYS
 from app.github_client import ensure_repo, create_branch_from_default, upsert_file, open_pr
+from app.worker import process_run
 
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "./artifacts")).resolve()
 
@@ -183,7 +184,7 @@ def create_run(project_id: int, data: RunCreate):
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     queue = Queue(connection=Redis.from_url(redis_url))
-    queue.enqueue("app.worker.process_run", run_id)
+    queue.enqueue(process_run, run_id)
     with get_db() as db:
         run = db.get(Run, run_id)
         return _run_response(run)
@@ -235,7 +236,7 @@ def rerun(run_id: int, data: RunCreate):
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     queue = Queue(connection=Redis.from_url(redis_url))
-    queue.enqueue("app.worker.process_run", new_run_id)
+    queue.enqueue(process_run, new_run_id)
     with get_db() as db:
         run = db.get(Run, new_run_id)
         return _run_response(run)
