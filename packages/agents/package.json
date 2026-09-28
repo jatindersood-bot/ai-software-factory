@@ -1,0 +1,13 @@
+{
+  "name": "@ai-software-factory/agents",
+  "version": "0.1.0",
+  "private": true,
+  "main": "runAgent.ts",
+  "types": "runAgent.ts",
+  "exports": {
+    ".": "./runAgent.ts",
+    "./contracts": "./contracts.ts",
+    "./prompts/pm": "./prompts/pm.ts",
+    "./prompts/ba": "./prompts/ba.ts"
+  }
+}

@@ -10,17 +10,20 @@ from pydantic import BaseModel, Field
 class ProjectCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=512)
     idea: str = Field(..., min_length=1)
+    idea_json: Optional[dict[str, Any]] = None
 
 
 class ProjectResponse(BaseModel):
     id: int
     title: str
     idea: str
+    idea_json: Optional[dict[str, Any]] = None
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
     github_repo_url: Optional[str] = None
     github_default_branch: str = "main"
     created_at: datetime
+    last_run_status: Optional[str] = None  # set by list endpoint; latest run status
 
     class Config:
         from_attributes = True
@@ -29,6 +32,7 @@ class ProjectResponse(BaseModel):
 # --- Run ---
 class RunCreate(BaseModel):
     agent_key: str = Field(..., min_length=1, max_length=64)
+    parent_run_id: Optional[int] = None
 
 
 class RunResponse(BaseModel):
@@ -41,6 +45,7 @@ class RunResponse(BaseModel):
     output_json: Optional[dict[str, Any]] = None
     created_at: datetime
     artifacts: list["ArtifactResponse"] = Field(default_factory=list)
+    approval_decision: Optional[str] = None  # "approved" | "rejected" | null (pending)
 
     class Config:
         from_attributes = True

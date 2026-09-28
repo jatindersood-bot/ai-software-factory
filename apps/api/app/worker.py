@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Base, Project, Run, Artifact
 from app.agents import run_agent
+from app.agent_contracts import validate_agent_result, apply_gates
 from app.github_client import ensure_repo, upsert_file
 
 load_dotenv()
@@ -32,6 +33,18 @@ AGENT_ARTIFACT_FILENAMES: dict[str, str] = {
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+UPSTREAM_DEPENDENCIES: dict[str, list[str]] = {
+    # PM / BA chain
+    "business_analyst": ["idea_clarifier", "prd"],
+    # Architect consumes BA/PRD
+    "architect": ["business_analyst", "prd"],
+    # Developer consumes BA + architect
+    "ai_development": ["business_analyst", "architect"],
+    # Tester consumes BA + architect + developer
+    "tester": ["business_analyst", "architect", "ai_development"],
+}
 
 
 def _json_safe(obj):
@@ -56,6 +69,160 @@ def _write_text(path: str, content: str) -> None:
         os.makedirs(d, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def _default_next_step_prompt(agent_key: str) -> str:
+    prompts = {
+        "business_analyst": "Review the BRD and backlog, then approve to unlock Architecture.",
+        "architect": "Review the architecture and diagrams, then approve to unlock Development.",
+        "ai_development": "Review the implementation and generated code, then approve to unlock Testing.",
+        "tester": "Review the test artifacts and smoke results, then approve to unlock Apply to workspace.",
+        "apply_workspace": "Review workspace changes, then approve before running Smoke check.",
+        "smoke_check": "Review the smoke test report, then approve to unlock Preview.",
+        "preview_start": "Verify the preview works as expected.",
+        "open_pr": "Review the PR in GitHub.",
+        "ship": "Verify the shipped repository and deployment.",
+    }
+    return prompts.get(agent_key, "Review this stage and approve to continue.")
+
+
+def _build_context_for_agent(session: Session, project_id: int, agent_key: str) -> str:
+    """
+    Build CONTEXT markdown for an agent from upstream completed runs' primary artifacts.
+
+    If upstream artifacts are missing, include explicit MISSING notes so the agent
+    can report gaps instead of inventing content.
+    """
+    upstream_keys = UPSTREAM_DEPENDENCIES.get(agent_key, [])
+    if not upstream_keys:
+        return ""
+
+    lines: list[str] = []
+    for key in upstream_keys:
+        latest = (
+            session.query(Run)
+            .filter(Run.project_id == project_id, Run.agent_key == key, Run.status == "completed")
+            .order_by(Run.created_at.desc())
+            .first()
+        )
+        if not latest:
+            lines.append(f"## {key}\nMISSING: no completed run found for `{key}`.\n")
+            continue
+
+        # Prefer the primary artifact filename mapping; fall back to first artifact row.
+        primary_filename = AGENT_ARTIFACT_FILENAMES.get(key)
+        artifact_row: Artifact | None = None
+        if primary_filename:
+            artifact_row = (
+                session.query(Artifact)
+                .filter(Artifact.run_id == latest.id)
+                .filter(Artifact.path.like(f"{project_id}/{latest.id}/%"))
+                .filter(Artifact.path.endswith(primary_filename))
+                .order_by(Artifact.created_at.asc())
+                .first()
+            )
+        if artifact_row is None:
+            artifact_row = (
+                session.query(Artifact)
+                .filter(Artifact.run_id == latest.id)
+                .order_by(Artifact.created_at.asc())
+                .first()
+            )
+        if artifact_row is None:
+            lines.append(f"## {key}\nMISSING: no artifacts found for run {latest.id}.\n")
+            continue
+
+        full_path = ARTIFACTS_DIR / artifact_row.path
+        try:
+            content = full_path.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+        header = f"## {key} (run {latest.id})"
+        body = content.strip() or "(artifact file empty or unreadable)"
+        lines.append(f"{header}\n\n{body}\n")
+
+    return "\n".join(lines).strip()
+
+
+def _project_spec_paths(project_id: int) -> tuple[Path, Path]:
+    """Return canonical project-level SPEC.json and CONTEXT_PACK.md paths."""
+    project_root = ARTIFACTS_DIR / str(project_id)
+    project_root.mkdir(parents=True, exist_ok=True)
+    return project_root / "SPEC.json", project_root / "CONTEXT_PACK.md"
+
+
+def _load_project_spec(project_id: int) -> tuple[dict, str]:
+    """Load canonical SPEC.json and CONTEXT_PACK.md for a project. Returns (spec, context_text)."""
+    spec_path, context_path = _project_spec_paths(project_id)
+    spec: dict = {}
+    if spec_path.is_file():
+        try:
+            raw = spec_path.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                spec = loaded
+        except Exception:
+            spec = {}
+    context_text = ""
+    if context_path.is_file():
+        try:
+            context_text = context_path.read_text(encoding="utf-8")
+        except Exception:
+            context_text = ""
+    return spec, context_text
+
+
+def _deep_merge(target: dict, patch: dict) -> dict:
+    """Recursively merge patch into target (in-place), returning target."""
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)  # type: ignore[index]
+        else:
+            target[key] = value
+    return target
+
+
+def _apply_spec_patch_for_run(
+    project_id: int,
+    run: Run,
+    artifact_dir: str,
+    spec_patch: dict,
+    summary: str | None = None,
+) -> None:
+    """
+    Apply spec_patch JSON to canonical SPEC.json and update CONTEXT_PACK.md.
+
+    Writes updated SPEC.json and CONTEXT_PACK.md at project level and also
+    copies them into this run's artifact directory so each stage snapshot is captured.
+    """
+    if not isinstance(spec_patch, dict):
+        return
+    spec, context_text = _load_project_spec(project_id)
+    spec = _deep_merge(spec, spec_patch)
+    spec_path, context_path = _project_spec_paths(project_id)
+    # Write updated SPEC.json
+    spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+    # Append simple entry to CONTEXT_PACK.md
+    lines: list[str] = []
+    if context_text:
+        lines.append(context_text.rstrip())
+        lines.append("")
+    lines.append(f"## Run {run.id} ({run.agent_key})")
+    if summary:
+        lines.append(f"Summary: {summary}")
+    patch_keys = ", ".join(sorted(spec_patch.keys()))
+    if patch_keys:
+        lines.append(f"Patched keys: {patch_keys}")
+    lines.append("")
+    context_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    # Copy canonical SPEC.json and CONTEXT_PACK.md into this run's artifact directory.
+    run_dir = Path(artifact_dir)
+    run_spec = run_dir / "SPEC.json"
+    run_context = run_dir / "CONTEXT_PACK.md"
+    run_spec.write_text(spec_path.read_text(encoding="utf-8"), encoding="utf-8")
+    run_context.write_text(context_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def _run_cmd(cwd: Path, *args: str) -> str:
@@ -444,7 +611,8 @@ def _execute_apply_workspace(session: Session, run: Run, project: Project) -> No
 
 
 def _execute_smoke_check(session: Session, run: Run, project_id: int) -> None:
-    """Run after apply_workspace: compile backend (compileall), optional npm run build for frontend. Write SMOKE_CHECK.txt; mark run failed if any step fails."""
+    """Run after apply_workspace: compile backend (compileall), optional npm run build for frontend.
+    Write SMOKE_CHECK.txt, SMOKE_TEST.md, FRONTEND_BUILD.log, PREVIEW_INSTRUCTIONS.md; set output_json (smoke_ok, frontend_build_ok, preview_instructions_path)."""
     import subprocess
 
     parent_id = run.parent_run_id
@@ -464,8 +632,13 @@ def _execute_smoke_check(session: Session, run: Run, project_id: int) -> None:
 
     artifact_dir = ARTIFACTS_DIR / str(project_id) / str(run.id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    rel_dir = f"{run.project_id}/{run.id}"
     lines: list[str] = []
     failed = False
+    had_frontend = False
+    frontend_build_ok = False
+    frontend_build_out = ""
+    frontend_build_err = ""
 
     # Backend: python -m compileall in generated backend folder
     backend_dir = target_dir / "backend"
@@ -489,11 +662,13 @@ def _execute_smoke_check(session: Session, run: Run, project_id: int) -> None:
         frontend_dir = target_dir
     package_json = frontend_dir / "package.json"
     if package_json.is_file():
+        had_frontend = True
         lines.append("## Frontend (npm install + npm run build)\n")
         # Apply same fixers as preview so generated code builds
         _apply_nextjs_client_directive_fix(target_dir, None)
         _ensure_app_globals_css(frontend_dir)
         _normalize_frontend_package_json_for_build(frontend_dir)
+        _ensure_frontend_tsconfig(frontend_dir)
         # Remove node_modules and lockfile so install is clean
         node_modules = frontend_dir / "node_modules"
         if node_modules.is_dir():
@@ -523,6 +698,8 @@ def _execute_smoke_check(session: Session, run: Run, project_id: int) -> None:
                 code = -1
                 out = ""
                 err = "Command timed out after 120s"
+            frontend_build_out = out or ""
+            frontend_build_err = err or ""
             lines.append(f"npm run build exit code: {code}\n")
             if out:
                 lines.append("stdout:\n")
@@ -533,20 +710,61 @@ def _execute_smoke_check(session: Session, run: Run, project_id: int) -> None:
             lines.append("\n")
             if code != 0:
                 failed = True
+            else:
+                frontend_build_ok = True
     else:
         lines.append("## Frontend\n\nNo package.json found; skipping npm build.\n\n")
 
+    smoke_content = "".join(lines)
     smoke_path = artifact_dir / "SMOKE_CHECK.txt"
-    smoke_path.write_text("".join(lines), encoding="utf-8")
-    rel_dir = f"{run.project_id}/{run.id}"
+    smoke_path.write_text(smoke_content, encoding="utf-8")
     session.add(Artifact(run_id=run.id, project_id=run.project_id, path=f"{rel_dir}/SMOKE_CHECK.txt"))
+
+    smoke_test_md = artifact_dir / "SMOKE_TEST.md"
+    smoke_test_md.write_text(smoke_content, encoding="utf-8")
+    session.add(Artifact(run_id=run.id, project_id=run.project_id, path=f"{rel_dir}/SMOKE_TEST.md"))
+
+    if had_frontend:
+        frontend_build_log = artifact_dir / "FRONTEND_BUILD.log"
+        log_content = f"# npm run build\n\n## stdout\n\n{frontend_build_out}\n\n## stderr\n\n{frontend_build_err}"
+        frontend_build_log.write_text(log_content, encoding="utf-8")
+        session.add(Artifact(run_id=run.id, project_id=run.project_id, path=f"{rel_dir}/FRONTEND_BUILD.log"))
+
+    frontend_rel = "frontend" if (target_dir / "frontend").is_dir() else "."
+    preview_instructions = f"""# Run the generated frontend locally
+
+From the workspace repo, run:
+
+```bash
+cd generated_projects/{project_id}/{frontend_rel}
+npm install
+npm run dev -- -p 3001
+```
+
+Then open: http://localhost:3001
+"""
+    preview_instructions_path = f"{rel_dir}/PREVIEW_INSTRUCTIONS.md"
+    pi_path = artifact_dir / "PREVIEW_INSTRUCTIONS.md"
+    pi_path.write_text(preview_instructions, encoding="utf-8")
+    session.add(Artifact(run_id=run.id, project_id=run.project_id, path=preview_instructions_path))
+
+    smoke_ok = not failed
+    output_payload: dict = {
+        "smoke_ok": smoke_ok,
+        "frontend_build_ok": frontend_build_ok,
+        "preview_instructions_path": preview_instructions_path,
+        "artifact_dir": str(artifact_dir),
+    }
+    if smoke_ok:
+        output_payload["summary"] = "Smoke check passed"
+    else:
+        output_payload["error"] = "Smoke check failed (compile or build)"
 
     if failed:
         run.status = "failed"
-        run.output_json = _json_safe({"error": "Smoke check failed (compile or build)", "artifact_dir": str(artifact_dir)})
     else:
         run.status = "completed"
-        run.output_json = _json_safe({"summary": "Smoke check passed", "artifact_dir": str(artifact_dir)})
+    run.output_json = _json_safe(output_payload)
     session.commit()
 
 
@@ -703,6 +921,21 @@ def _normalize_preview_package_json(frontend_dir: Path) -> list[str]:
             deps[key] = target_val
             changes.append(f"- Set `{key}` to `{target_val}`" + (f" (was `{current}`)" if current else " (added)"))
 
+    # Ensure TypeScript devDependencies so Next does not mutate repo during build
+    dev_deps = data.get("devDependencies")
+    if dev_deps is None:
+        dev_deps = {}
+        data["devDependencies"] = dev_deps
+    elif not isinstance(dev_deps, dict):
+        dev_deps = {}
+        data["devDependencies"] = dev_deps
+    ts_dev = {"typescript": "^5.0.0", "@types/node": "^20.0.0", "@types/react": "^18.0.0", "@types/react-dom": "^18.0.0"}
+    for key, target_val in ts_dev.items():
+        current = dev_deps.get(key)
+        if current != target_val:
+            dev_deps[key] = target_val
+            changes.append(f"- Set devDependency `{key}` to `{target_val}`" + (f" (was `{current}`)" if current else " (added)"))
+
     if not changes:
         return []
 
@@ -712,9 +945,9 @@ def _normalize_preview_package_json(frontend_dir: Path) -> list[str]:
 
 def _normalize_frontend_package_json_for_build(frontend_dir: Path) -> list[str]:
     """
-    Ensure package.json has scripts (dev, build, start) and compatible dependency versions
-    for Next 14 (next ^14.2.0, react/react-dom ^18.2.0). Used before npm install in smoke_check.
-    Returns list of change descriptions.
+    Ensure package.json has scripts (dev, build, start), dependency versions for Next 14,
+    and TypeScript devDependencies so Next does not mutate the repo during build.
+    Used before npm install in smoke_check. Returns list of change descriptions.
     """
     pkg_path = frontend_dir / "package.json"
     if not pkg_path.is_file():
@@ -747,12 +980,27 @@ def _normalize_frontend_package_json_for_build(frontend_dir: Path) -> list[str]:
         data["dependencies"] = deps
     elif not isinstance(deps, dict):
         return changes
-    target_versions = {"next": "^14.2.0", "react": "^18.2.0", "react-dom": "^18.2.0"}
+    target_versions = {"next": "14.2.35", "react": "^18.2.0", "react-dom": "^18.2.0"}
     for key, target_val in target_versions.items():
         current = deps.get(key)
         if current != target_val:
             deps[key] = target_val
             changes.append(f"- Set `{key}` to `{target_val}`" + (f" (was `{current}`)" if current else " (added)"))
+
+    # Ensure TypeScript devDependencies so Next does not mutate repo during build
+    dev_deps = data.get("devDependencies")
+    if dev_deps is None:
+        dev_deps = {}
+        data["devDependencies"] = dev_deps
+    elif not isinstance(dev_deps, dict):
+        dev_deps = {}
+        data["devDependencies"] = dev_deps
+    ts_dev = {"typescript": "^5.0.0", "@types/node": "^20.0.0", "@types/react": "^18.0.0", "@types/react-dom": "^18.0.0"}
+    for key, target_val in ts_dev.items():
+        current = dev_deps.get(key)
+        if current != target_val:
+            dev_deps[key] = target_val
+            changes.append(f"- Set devDependency `{key}` to `{target_val}`" + (f" (was `{current}`)" if current else " (added)"))
 
     if not changes:
         return []
@@ -760,11 +1008,59 @@ def _normalize_frontend_package_json_for_build(frontend_dir: Path) -> list[str]:
     return changes
 
 
+def _ensure_frontend_tsconfig(frontend_dir: Path) -> bool:
+    """
+    Ensure frontend has tsconfig.json so Next does not create or mutate it during build.
+    Only writes when package.json exists and tsconfig.json is missing (Next/TS app).
+    Returns True if tsconfig was written.
+    """
+    pkg_path = frontend_dir / "package.json"
+    tsconfig_path = frontend_dir / "tsconfig.json"
+    if not pkg_path.is_file() or tsconfig_path.is_file():
+        return False
+    try:
+        data = json.loads(pkg_path.read_text(encoding="utf-8"))
+        deps = data.get("dependencies") or {}
+        if not isinstance(deps, dict) or "next" not in deps:
+            return False
+    except Exception:
+        return False
+    # Standard Next.js App Router tsconfig
+    config = {
+        "compilerOptions": {
+            "target": "ES2017",
+            "lib": ["dom", "dom.iterable", "esnext"],
+            "allowJs": True,
+            "skipLibCheck": True,
+            "strict": True,
+            "noEmit": True,
+            "esModuleInterop": True,
+            "module": "esnext",
+            "moduleResolution": "bundler",
+            "resolveJsonModule": True,
+            "isolatedModules": True,
+            "jsx": "preserve",
+            "incremental": True,
+            "plugins": [{"name": "next"}],
+            "baseUrl": ".",
+            "paths": {"@/*": ["./*"]},
+        },
+        "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+        "exclude": ["node_modules"],
+    }
+    try:
+        tsconfig_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
 def _execute_preview_start(session: Session, run: Run, project_id: int) -> None:
     """
-    Find parent run's generated_code, copy to workspaces/<project_id>/previews/<parent_run_id>/,
-    detect frontend (package.json) and/or backend (requirements.txt + main.py), start frontend
-    dev server on port 3100 + project_id, write PREVIEW.json with ui_url, port, cwd, pid; set output_json same.
+    Start the generated Next app on port 3001 in a detached background process.
+    Prefer workspace generated_projects (after smoke_check); else copy from parent's generated_code.
+    Write PREVIEW_URL.txt, PREVIEW_LOG.txt, PREVIEW_PID.txt and PREVIEW.json; set output_json.preview_url.
+    Return immediately (do not block worker).
     """
     parent_id = run.parent_run_id
     if not parent_id:
@@ -780,97 +1076,128 @@ def _execute_preview_start(session: Session, run: Run, project_id: int) -> None:
         session.commit()
         return
 
-    parent_artifact_dir = ARTIFACTS_DIR / str(project_id) / str(parent_id)
-    generated_code_src = parent_artifact_dir / "generated_code"
-    if not generated_code_src.is_dir():
-        run.status = "failed"
-        run.output_json = _json_safe({"error": f"Parent run has no generated_code at {generated_code_src}"})
-        session.commit()
-        return
-
-    preview_dir = WORKSPACES_DIR / str(project_id) / "previews" / str(parent_id)
-    if preview_dir.exists():
-        shutil.rmtree(preview_dir)
-    shutil.copytree(generated_code_src, preview_dir)
-
-    frontend_dir = _find_frontend_dir(preview_dir)
-    backend_dir = _find_backend_dir(preview_dir)
-
-    port = 3100 + project_id
+    artifact_dir = ARTIFACTS_DIR / str(project_id) / str(run.id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    rel_dir = f"{project_id}/{run.id}"
+    port = 3001
+    preview_url = f"http://localhost:{port}"
     ui_url: str | None = None
     cwd: str | None = None
     pid: int | None = None
+    frontend_dir: Path | None = None
 
-    if frontend_dir is not None:
-        # Add "use client"; to frontend/app *.{ts,tsx} that use hooks, before npm install
+    # Prefer workspace generated_projects (after apply_workspace + smoke_check)
+    workspace_repo = WORKSPACES_DIR / str(project_id) / "repo"
+    target_dir = workspace_repo / "generated_projects" / str(project_id)
+    if target_dir.is_dir():
+        frontend_dir = _find_frontend_dir(target_dir)
+        if frontend_dir is not None and (frontend_dir / "package.json").is_file():
+            # If node_modules missing (e.g. smoke_check skipped frontend), install now
+            if not (frontend_dir / "node_modules").is_dir():
+                _normalize_frontend_package_json_for_build(frontend_dir)
+                _ensure_frontend_tsconfig(frontend_dir)
+                code, _, err = _run_cmd_capture(frontend_dir, "npm", "install", timeout=180)
+                if code != 0:
+                    run.status = "failed"
+                    run.output_json = _json_safe({"error": f"npm install failed: {err or 'non-zero exit'}"})
+                    session.commit()
+                    return
+            cwd = str(frontend_dir)
+    # Else use parent's generated_code from artifacts (e.g. parent = ai_development run)
+    if frontend_dir is None:
+        parent_artifact_dir = ARTIFACTS_DIR / str(project_id) / str(parent_id)
+        generated_code_src = parent_artifact_dir / "generated_code"
+        if not generated_code_src.is_dir():
+            run.status = "failed"
+            run.output_json = _json_safe({
+                "error": "No frontend found. Run apply_workspace and smoke_check first, or use a run that has generated_code.",
+            })
+            session.commit()
+            return
+        preview_dir = WORKSPACES_DIR / str(project_id) / "previews" / str(parent_id)
+        if preview_dir.exists():
+            shutil.rmtree(preview_dir)
+        shutil.copytree(generated_code_src, preview_dir)
+        frontend_dir = _find_frontend_dir(preview_dir)
+        if frontend_dir is None:
+            run.status = "failed"
+            run.output_json = _json_safe({"error": "No frontend (package.json) in generated code"})
+            session.commit()
+            return
         _apply_nextjs_client_directive_fix(preview_dir, None)
-        # Fix linked routes like /submit when code mistakenly generates app/submit.tsx
         _ensure_nextjs_linked_routes(frontend_dir)
-        # Ensure app/globals.css exists if layout.tsx imports it (avoid build failure)
         _ensure_app_globals_css(frontend_dir)
-        # Normalize package.json versions (next 14.2.35, react/react-dom 18.2.0) before npm install
-        changes = _normalize_preview_package_json(frontend_dir)
+        _normalize_preview_package_json(frontend_dir)
+        _ensure_frontend_tsconfig(frontend_dir)
         lock_path = frontend_dir / "package-lock.json"
         if lock_path.is_file():
             lock_path.unlink()
-        # Log dependency changes to artifact
-        artifact_dir = ARTIFACTS_DIR / str(project_id) / str(run.id)
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        rel_dir = f"{project_id}/{run.id}"
-        if changes:
-            md_lines = ["# Preview dependencies", "", "Normalized versions for Next 14 compatibility:", ""] + changes
-            (artifact_dir / "PREVIEW_DEPENDENCIES.md").write_text("\n".join(md_lines), encoding="utf-8")
-            session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW_DEPENDENCIES.md"))
-
         code, _, err = _run_cmd_capture(frontend_dir, "npm", "install", timeout=180)
         if code != 0:
             run.status = "failed"
             run.output_json = _json_safe({"error": f"npm install failed: {err or 'non-zero exit'}"})
             session.commit()
             return
-        # Optional next_build_check: run npm run build; if it fails, capture error and mark run failed
-        if os.getenv("NEXT_BUILD_CHECK", "").lower() in ("1", "true", "yes"):
-            build_code, build_out, build_err = _run_cmd_capture(frontend_dir, "npm", "run", "build", timeout=300)
-            if build_code != 0:
-                artifact_dir = ARTIFACTS_DIR / str(project_id) / str(run.id)
-                artifact_dir.mkdir(parents=True, exist_ok=True)
-                rel_dir = f"{project_id}/{run.id}"
-                error_content = f"# Next.js build failed (exit code {build_code})\n\n## stdout\n\n{build_out}\n\n## stderr\n\n{build_err}"
-                (artifact_dir / "BUILD_ERROR.txt").write_text(error_content, encoding="utf-8")
-                session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/BUILD_ERROR.txt"))
-                run.status = "failed"
-                run.output_json = _json_safe({
-                    "error": "Next.js build failed",
-                    "build_stdout": build_out,
-                    "build_stderr": build_err,
-                })
-                session.commit()
-                return
-        proc = subprocess.Popen(
-            ["npm", "run", "dev", "--", "-p", str(port)],
-            cwd=str(frontend_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        ui_url = f"http://localhost:{port}"
         cwd = str(frontend_dir)
-        pid = proc.pid
 
-    artifact_dir = ARTIFACTS_DIR / str(project_id) / str(run.id)
-    if not artifact_dir.exists():
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-    rel_dir = f"{project_id}/{run.id}"
+    if frontend_dir is not None and cwd:
+        log_file = artifact_dir / "PREVIEW_LOG.txt"
+        env = os.environ.copy()
+        # Ensure frontend calls the FastAPI backend on localhost:8000.
+        env.setdefault("NEXT_PUBLIC_API_BASE", "http://localhost:8000")
+        with open(log_file, "w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                ["npm", "run", "dev", "--", "-p", str(port)],
+                cwd=cwd,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+            )
+        pid = proc.pid
+        ui_url = preview_url
+
+        (artifact_dir / "PREVIEW_URL.txt").write_text(preview_url, encoding="utf-8")
+        (artifact_dir / "PREVIEW_PID.txt").write_text(str(pid), encoding="utf-8")
+        session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW_URL.txt"))
+        session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW_LOG.txt"))
+        session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW_PID.txt"))
+    else:
+        run.status = "failed"
+        run.output_json = _json_safe({"error": "No frontend (package.json) found in workspace or parent artifacts"})
+        session.commit()
+        return
 
     preview_payload = {
+        "preview_url": preview_url,
         "ui_url": ui_url,
         "port": port,
         "cwd": cwd,
         "pid": pid,
     }
-    preview_path = artifact_dir / "PREVIEW.json"
-    preview_path.write_text(json.dumps(preview_payload, indent=2), encoding="utf-8")
+    (artifact_dir / "PREVIEW.json").write_text(json.dumps(preview_payload, indent=2), encoding="utf-8")
     session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW.json"))
+
+    # Human-friendly PREVIEW.md with commands and URLs.
+    preview_md_lines = [
+        "# Preview",
+        "",
+        f"- Backend API: http://localhost:8000",
+        f"- Frontend UI: {preview_url}",
+        "",
+        "## How to start (already started by worker)",
+        "```bash",
+        f"cd {cwd}",
+        "export NEXT_PUBLIC_API_BASE=http://localhost:8000",
+        f"npm run dev -- -p {port}",
+        "```",
+        "",
+        "## How to stop",
+        f"- Kill PID {pid} (or use the preview_stop API).",
+    ]
+    preview_md_path = artifact_dir / "PREVIEW.md"
+    preview_md_path.write_text("\n".join(preview_md_lines), encoding="utf-8")
+    session.add(Artifact(run_id=run.id, project_id=project_id, path=f"{rel_dir}/PREVIEW.md"))
 
     run.status = "completed"
     run.output_json = _json_safe(preview_payload)
@@ -1004,6 +1331,10 @@ def process_run(run_id: int) -> None:
         try:
             input_json = dict(run.input_json or {})
             input_json.setdefault("project_id", run.project_id)
+            # Inject upstream artifacts as CONTEXT so agents can consume prior deliverables.
+            context_md = _build_context_for_agent(session, run.project_id, run.agent_key)
+            if context_md:
+                input_json["context_markdown"] = context_md
             agent_result = run_agent(
                 run.agent_key,
                 project.title,
@@ -1032,11 +1363,55 @@ def process_run(run_id: int) -> None:
         artifact_dir = os.path.join(str(ARTIFACTS_DIR), str(run.project_id), str(run.id))
         os.makedirs(artifact_dir, exist_ok=True)
 
-        # 1) Write normal artifacts (markdown)
+        # SPEC.json / CONTEXT_PACK.md canonical spec patch handling
+        if isinstance(result, dict):
+            spec_patch = result.get("spec_patch")
+            if isinstance(spec_patch, dict):
+                summary_for_spec = result.get("summary") if isinstance(result.get("summary"), str) else None
+                _apply_spec_patch_for_run(run.project_id, run, artifact_dir, spec_patch, summary_for_spec)
+
+        # Artifact contract: for prd/business_analyst, if result is envelope with artifacts list, validate and gate
+        if run.agent_key in ("prd", "business_analyst") and isinstance(result, dict):
+            artifacts_list = result.get("artifacts")
+            if isinstance(artifacts_list, list) and len(artifacts_list) > 0:
+                first = artifacts_list[0]
+                if isinstance(first, dict) and "contentMarkdown" in first and "type" in first:
+                    valid, reason, artifacts = validate_agent_result(result)
+                    if not valid:
+                        run.status = "failed"
+                        run.output_json = _json_safe({"ok": False, "reason": reason or "Agent returned invalid result"})
+                        session.commit()
+                        return
+                    gate_ok, gate_reason = apply_gates(artifacts)
+                    if not gate_ok:
+                        # Save artifacts so UI can show them and user can re-run with feedback
+                        rel_dir = f"{run.project_id}/{run.id}"
+                        dir_path = Path(artifact_dir)
+                        for i, art in enumerate(artifacts):
+                            if not isinstance(art, dict):
+                                continue
+                            content = art.get("contentMarkdown") or ""
+                            art_type = art.get("type") or "ARTIFACT"
+                            fname = f"{art_type}_{i}.md" if i else f"{art_type}.md"
+                            (dir_path / fname).write_text(content, encoding="utf-8")
+                            session.add(Artifact(run_id=run.id, project_id=run.project_id, path=f"{rel_dir}/{fname}"))
+                        run.status = "failed"
+                        run.output_json = _json_safe({
+                            "ok": False,
+                            "reason": gate_reason,
+                            "gate_failed": True,
+                            "artifacts_saved": True,
+                        })
+                        session.commit()
+                        return
+
+        # 1) Write normal artifacts (markdown) — only when artifacts is dict (legacy shape)
         if isinstance(result, dict) and "artifacts" in result:
-            for name, content in result["artifacts"].items():
-                if isinstance(content, str):
-                    _write_text(os.path.join(artifact_dir, name), content)
+            art = result["artifacts"]
+            if isinstance(art, dict):
+                for name, content in art.items():
+                    if isinstance(content, str):
+                        _write_text(os.path.join(artifact_dir, name), content)
 
         # 2) Write generated code files under generated_code/
         if isinstance(result, dict) and "generated_files" in result:
@@ -1063,6 +1438,10 @@ def process_run(run_id: int) -> None:
             artifacts = agent_result.get("artifacts")
             if isinstance(artifacts, dict) and not md_value:
                 md_value = artifacts.get("IMPLEMENTATION_PLAN.md")
+            if isinstance(artifacts, list) and len(artifacts) > 0 and not md_value:
+                first_art = artifacts[0]
+                if isinstance(first_art, dict) and "contentMarkdown" in first_art:
+                    md_value = first_art.get("contentMarkdown")
             if isinstance(md_value, str):
                 markdown = md_value
 
@@ -1077,11 +1456,16 @@ def process_run(run_id: int) -> None:
                         session.add(artifact_obj)
                         additional_artifacts.append(artifact_obj)
             elif isinstance(artifacts_payload, list):
-                for item in artifacts_payload:
+                for i, item in enumerate(artifacts_payload):
                     if not isinstance(item, dict):
                         continue
                     path = item.get("path")
                     content = item.get("content")
+                    # New contract: { type, title, contentMarkdown }
+                    if content is None and "contentMarkdown" in item:
+                        content = item.get("contentMarkdown") or ""
+                        art_type = item.get("type") or "ARTIFACT"
+                        path = path or (f"{art_type}.md" if i == 0 else f"{art_type}_{i}.md")
                     if not isinstance(path, str) or not isinstance(content, str):
                         continue
                     artifact_file = dir_path / path
@@ -1125,6 +1509,7 @@ def process_run(run_id: int) -> None:
                     _ensure_app_globals_css(frontend_dir)
                     # Ensure package.json has dev/build/start scripts and compatible dependency versions
                     _normalize_frontend_package_json_for_build(frontend_dir)
+                    _ensure_frontend_tsconfig(frontend_dir)
             elif file_items:
                 generated_root = dir_path / "generated_code"
                 # Files may already be written via _write_text above; ensure index and avoid double-write.
@@ -1166,19 +1551,29 @@ def process_run(run_id: int) -> None:
 
         run.status = "completed"
         # 3) output_json: use agent's output_json when present (e.g. ai_development), else minimal
-        output_json: dict = (
-            result.get("output_json") if isinstance(result, dict) else {}
-        )
+        output_json: dict = result.get("output_json") if isinstance(result, dict) else {}
         if not output_json:
             output_json = {
                 "summary": result.get("summary", "") if isinstance(result, dict) else str(result),
             }
+
+        # Ensure schema fields are present for all agents.
+        artifacts_written = [
+            {"path": primary_artifact.path, "description": "primary"},
+            *(
+                {"path": a.path, "description": ""}
+                for a in additional_artifacts
+            ),
+        ]
+        output_json.setdefault("schema_version", "v1")
+        output_json.setdefault("artifacts_written", artifacts_written)
+        output_json.setdefault("next_step_prompt", _default_next_step_prompt(run.agent_key))
+
         output_json["artifact_dir"] = artifact_dir
         output_json["generated_code_dir"] = os.path.join(artifact_dir, "generated_code")
         gen_code_path = dir_path / "generated_code"
         output_json["build_type"] = _detect_build_type(gen_code_path)
-        out = output_json
-        out = _json_safe(out)
+        out = _json_safe(output_json)
         run.output_json = out
         session.commit()
     finally:

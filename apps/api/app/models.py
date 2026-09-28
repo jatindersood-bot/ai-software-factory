@@ -19,6 +19,7 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     idea: Mapped[str] = mapped_column(Text, nullable=False)
+    idea_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # Full project brief from PM chat
     github_owner: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     github_repo: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     github_repo_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)

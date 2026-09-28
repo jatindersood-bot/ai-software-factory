@@ -74,14 +74,17 @@ Rules:
    - app/page.tsx home page
    - If calling backend /health: backend must implement GET /health returning {"status": "ok"}
    - Displays backend status when using /health
-   - package.json
+   - package.json (with dependencies and devDependencies as in rule 4)
+   - tsconfig.json when using TypeScript (always for Next with .tsx)
    - Minimal config files
 
 4. **Frontend dependencies and scripts:**
    - Always generate `frontend/package.json` for Next.js App Router with:
      - **Scripts** (required): `"dev": "next dev"`, `"build": "next build"`, `"start": "next start"`.
-     - **Versions** (use exact or caret): `"next": "^14.2.0"` (or `"14.2.35"`), `"react": "^18.2.0"`, `"react-dom": "^18.2.0"`.
+     - **dependencies**: `"next": "14.2.35"` (or `"^14.2.0"`), `"react": "^18.2.0"`, `"react-dom": "^18.2.0"`.
+     - **devDependencies** (required so Next does not mutate the repo during build): `"typescript": "^5.0.0"`, `"@types/node": "^20.0.0"`, `"@types/react": "^18.0.0"`, `"@types/react-dom": "^18.0.0"`.
    - Never generate react or react-dom lower than 18.2.0 when using Next 14.
+   - When using TypeScript (e.g. `.tsx` files), **always generate `frontend/tsconfig.json`** from the start (standard Next.js tsconfig with compilerOptions for Next, include `**/*.ts`, `**/*.tsx`). This stops Next from creating or mutating tsconfig during build.
    - If a component uses hooks, the file must begin with `"use client";` (before any imports).
 
 5. **Next.js App Router — "use client" (strict):**
